@@ -1,10 +1,11 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import fitz  # PyMuPDF
+import fitz
 import os
 import json
 import urllib.request
+import urllib.parse
 
 app = FastAPI(title="RegOptica API")
 
@@ -15,35 +16,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODEL = "llama3-70b-8192"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 
 
-def call_groq(system_prompt, user_message):
+def call_gemini(prompt):
+    url = f"{GEMINI_URL}?key={GEMINI_API_KEY}"
     payload = json.dumps({
-        "model": MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message}
-        ],
-        "max_tokens": 1000,
-        "temperature": 0.1
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": 1000, "temperature": 0.1}
     }).encode("utf-8")
 
     req = urllib.request.Request(
-        GROQ_URL,
+        url,
         data=payload,
-        headers={
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json"
-        },
+        headers={"Content-Type": "application/json"},
         method="POST"
     )
 
     with urllib.request.urlopen(req) as response:
         result = json.loads(response.read().decode("utf-8"))
-        return result["choices"][0]["message"]["content"]
+        return result["candidates"][0]["content"]["parts"][0]["text"]
 
 
 class AskRequest(BaseModel):
@@ -68,22 +61,24 @@ async def extract_obligations(file: UploadFile = File(...)):
 
         trimmed_text = full_text[:5000]
 
-        system_prompt = """You are a SEBI regulatory compliance expert.
-Extract compliance obligations from SEBI regulatory documents.
+        prompt = f"""You are a SEBI regulatory compliance expert.
+Extract compliance obligations from this SEBI document.
 Return ONLY a valid JSON array. No markdown, no explanation, no code blocks.
-Each object must have these exact keys:
+Each object must have:
 - code: string like SC/KYC/001
-- obligation: string describing what must be done
+- obligation: what must be done
 - department: one of [KYC & Onboarding, Risk & Reporting, Investor Relations, Finance & Accounts, Operations]
-- deadline: date string in YYYY-MM-DD format (use dates in 2025)
+- deadline: YYYY-MM-DD format date in 2025
 - frequency: one of [Daily, Weekly, Monthly, Quarterly, Per new client, Per grievance, One-time]
-- evidence: string describing what proof is needed
+- evidence: what proof is needed
 - priority: one of [Critical, High, Medium, Low]
-Extract 4-5 obligations. Return ONLY the JSON array, nothing else."""
 
-        user_message = f"Extract compliance obligations from this SEBI document:\nFilename: {file.filename}\nContent:\n{trimmed_text}"
+Extract 4-5 obligations. Return ONLY the JSON array.
 
-        raw = call_groq(system_prompt, user_message)
+Document: {file.filename}
+Content: {trimmed_text}"""
+
+        raw = call_gemini(prompt)
         clean = raw.replace("```json", "").replace("```", "").strip()
         obligations = json.loads(clean)
 
@@ -98,14 +93,16 @@ Extract 4-5 obligations. Return ONLY the JSON array, nothing else."""
 @app.post("/ask")
 async def ask_assistant(data: AskRequest):
     try:
-        system_prompt = """You are RegOptica's AI compliance assistant for SEBI-registered stockbrokers.
-Help compliance officers understand SEBI obligations, deadlines, evidence requirements, and regulatory actions.
-Be concise, specific, and practical."""
+        prompt = f"""You are RegOptica's AI compliance assistant for SEBI-registered stockbrokers.
+Help compliance officers understand SEBI obligations, deadlines, and regulatory actions.
+Be concise and practical.
 
-        if data.context:
-            system_prompt += f"\n\nCurrent obligations:\n{data.context}"
+Current obligations:
+{data.context}
 
-        answer = call_groq(system_prompt, data.question)
+Question: {data.question}"""
+
+        answer = call_gemini(prompt)
         return {"success": True, "answer": answer}
 
     except Exception as e:
